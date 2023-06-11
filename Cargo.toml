@@ -1,0 +1,14 @@
+[workspace]
+members = [
+  "thread-pool",
+  "async-foo",
+  "tokio-bin",
+  "macro-expand",
+  "traitors",
+  "errrr",
+  "onion",
+]
+
+[workspace.package]
+edition = "2021"
+version = "0.1.0"
