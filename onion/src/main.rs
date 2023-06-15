@@ -1,12 +1,18 @@
 use anyhow::Result;
 use tokio;
 
-use crate::{auth::Auth, repos::Repos, services::Services};
+use crate::repos::IngredientRepo;
+#[cfg_attr(test, mockall_double::double)]
+use crate::repos::{RecipeRepo, UserRepo};
+use crate::{auth::Auth, services::Services};
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    let repos = Repos::default();
-    let services = Services::new(repos);
+    let services = Services::new(
+        UserRepo::default(),
+        RecipeRepo::default(),
+        IngredientRepo::default(),
+    );
 
     // fake example request
     let session = Auth::new();
@@ -19,12 +25,15 @@ async fn main() -> Result<()> {
 }
 
 mod services {
-
     use std::ops::Not;
 
-    use crate::auth::Auth;
+    use crate::auth::{Auth, Authed};
     use crate::domain::Recipes;
-    use crate::repos::{IngredientRepo, RecipeRepo, Repos, UserRepo};
+
+    #[cfg_attr(test, mockall_double::double)]
+    use crate::repos::{RecipeRepo, UserRepo};
+
+    use crate::repos::IngredientRepo;
     use anyhow::{anyhow, Result};
 
     pub struct Services {
@@ -32,12 +41,12 @@ mod services {
     }
 
     impl Services {
-        pub fn new(repos: Repos) -> Self {
+        pub fn new(users: UserRepo, recipe: RecipeRepo, ingredient: IngredientRepo) -> Self {
             Self {
                 food: FoodService {
-                    users: repos.users,
-                    recipe: repos.recipe,
-                    ingredient: repos.ingredient,
+                    users,
+                    recipe,
+                    ingredient,
                 },
             }
         }
@@ -50,15 +59,58 @@ mod services {
     }
 
     impl FoodService {
-        pub async fn get_recipes(&self, auth: Auth) -> Result<Recipes> {
+        pub async fn get_recipes(&self, auth: impl Authed) -> Result<Recipes> {
             if auth.is_valid().not() {
                 return Err(anyhow!("session is not valid"));
             }
 
-            let recipe_list = self.users.get(auth.id()).await?.recipe;
+            let id = auth.id();
+            let recipe_list = self.users.get(id.to_string()).await?.recipe;
             let recipes = self.recipe.list(recipe_list).await?;
 
             Ok(Recipes::new(recipes))
+        }
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use fake::{Fake, Faker};
+        use mockall::predicate::eq;
+
+        use crate::{
+            auth::MockAuthed,
+            domain::{Recipe, User},
+        };
+
+        use super::*;
+
+        #[tokio::test]
+        async fn test_food_service_get_recipes() {
+            let mut mock_users = UserRepo::default();
+            let mut user = Faker.fake::<User>();
+            user.recipe = vec![1, 2, 3];
+
+            mock_users
+                .expect_get()
+                .with(eq("123".to_string()))
+                .return_once(move |_| Ok(user.clone()));
+
+            let mut mock_recipes = RecipeRepo::default();
+            mock_recipes
+                .expect_list()
+                .with(eq(vec![1, 2, 3]))
+                .return_once(|_| Ok(Faker.fake::<Vec<Recipe>>()));
+
+            let services = Services::new(mock_users, mock_recipes, IngredientRepo::default());
+
+            let mut mock_auth = MockAuthed::default();
+            mock_auth.expect_is_valid().return_once(|| true).once();
+            mock_auth.expect_id().return_const("123".into());
+
+            let res = services.food.get_recipes(mock_auth).await;
+            let Ok(_) = res else {
+                panic!("got {res:#?}");
+            };
         }
     }
 }
@@ -70,30 +122,26 @@ mod repos {
     use crate::domain::{Recipe, User};
 
     #[derive(Default)]
-    pub struct Repos {
-        pub users: UserRepo,
-        pub recipe: RecipeRepo,
-        pub ingredient: IngredientRepo,
-    }
-
-    #[derive(Default)]
     pub struct UserRepo {}
 
+    #[cfg_attr(test, mockall::automock)]
     impl UserRepo {
-        pub async fn get(&self, id: impl Into<String>) -> Result<User> {
+        pub async fn get(&self, id: String) -> Result<User> {
             Faker
                 .fake::<Result<User, ()>>()
-                .map_err(|_| anyhow!("oh no"))
+                .map_err(|_| anyhow!("oh user"))
         }
     }
 
     #[derive(Default)]
     pub struct RecipeRepo {}
+
+    #[cfg_attr(test, mockall::automock)]
     impl RecipeRepo {
         pub async fn list(&self, ids: Vec<i32>) -> Result<Vec<Recipe>> {
             Faker
                 .fake::<Result<Vec<Recipe>, ()>>()
-                .map_err(|_| anyhow!("oh no"))
+                .map_err(|_| anyhow!("oh recipe"))
         }
     }
 
@@ -111,25 +159,34 @@ mod auth {
         user_id: String,
     }
 
+    impl Auth {
+        pub fn new() -> Self {
+            Faker.fake()
+        }
+    }
+
+    #[cfg_attr(test, mockall::automock)]
+    pub trait Authed {
+        fn is_valid(&self) -> bool;
+        fn id(&self) -> &str;
+    }
+
+    impl Authed for Auth {
+        fn is_valid(&self) -> bool {
+            println!("jwt: {}", self.session.jwt);
+            self.session.valid
+        }
+
+        fn id(&self) -> &str {
+            &self.user_id
+        }
+    }
+
     #[derive(Dummy)]
     struct Session {
         jwt: String,
         #[dummy(faker = "Boolean(80)")]
         valid: bool,
-    }
-
-    impl Auth {
-        pub fn new() -> Self {
-            Faker.fake()
-        }
-        pub fn is_valid(&self) -> bool {
-            println!("jwt: {}", self.session.jwt);
-            self.session.valid
-        }
-
-        pub fn id(&self) -> &str {
-            &self.user_id
-        }
     }
 }
 
@@ -150,6 +207,7 @@ mod domain {
         pub recipe: Vec<i32>,
     }
 
+    #[derive(Debug)]
     pub struct Recipes(Vec<Recipe>);
     impl Recipes {
         pub fn new(r: Vec<Recipe>) -> Self {
